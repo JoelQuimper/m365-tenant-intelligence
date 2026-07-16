@@ -1,0 +1,31 @@
+# Sensitive/Local configuration files (DO NOT COMMIT)
+Set-DeveloperContext.ps1
+Set-DeveloperContext-*.ps1
+.env
+.env.local
+*.secrets
+*.credentials
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+bin/
+obj/
+dist/
+
+# Logs
+*.log
+logs/
+
+# Temp files
+*.tmp
+*.temp
+
