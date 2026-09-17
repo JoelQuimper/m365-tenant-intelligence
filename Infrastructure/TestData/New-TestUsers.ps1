@@ -9,8 +9,15 @@ param(
 	[int]$StartNumber = 39020
 )
 
-$BatchSize = 20
-$MaxBatchRetries = 8
+# Import required modules
+$projectRoot = "C:\src\public-github\m365-tenant-intelligence"
+Import-Module -Name "$projectRoot\Automations\Common\GraphClient\GraphClient.psm1" -Force
+Import-Module -Name "$projectRoot\Automations\Common\StorageClient\StorageClient.psm1" -Force
+
+# Source the Set-DeveloperContext to load environment variables
+. "$projectRoot\Automations\Set-DeveloperContext.ps1"
+
+$MaxRequestRetries = 8
 
 function Get-DefaultTenantDomain {
 	[CmdletBinding()]
@@ -19,8 +26,8 @@ function Get-DefaultTenantDomain {
 		[hashtable]$Headers
 	)
 
-	$org = Invoke-GraphRequest -Method 'GET' -Uri 'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains' -Headers $Headers
-	$verifiedDomains = @($org.value[0].verifiedDomains)
+	$org = Invoke-GraphPagedRequest -Uri 'https://graph.microsoft.com/v1.0/organization?$select=verifiedDomains' -Headers $Headers
+	$verifiedDomains = @($org[0].verifiedDomains)
 
 	if (-not $verifiedDomains -or $verifiedDomains.Count -eq 0) {
 		throw 'No verified tenant domains were returned from Microsoft Graph.'
@@ -46,158 +53,55 @@ function Get-RandomPassword {
     return $password
 }
 
-function Get-RetryAfterSeconds {
-	[CmdletBinding()]
-	param(
-		[Parameter(Mandatory = $false)]
-		[object]$ResponseHeaders
-	)
-
-	if ($null -eq $ResponseHeaders) {
-		return 0
-	}
-
-	$retryAfterValue = $null
-
-	if ($ResponseHeaders -is [System.Collections.IDictionary]) {
-		if ($ResponseHeaders.Contains('Retry-After')) {
-			$retryAfterValue = $ResponseHeaders['Retry-After']
-		} elseif ($ResponseHeaders.Contains('retry-after')) {
-			$retryAfterValue = $ResponseHeaders['retry-after']
-		}
-	}
-
-	if ($null -eq $retryAfterValue) {
-		return 0
-	}
-
-	$parsed = 0
-	if ([int]::TryParse([string]$retryAfterValue, [ref]$parsed)) {
-		return [Math]::Max(0, $parsed)
-	}
-
-	return 0
-}
-
-function Invoke-UserCreateBatchWithRetry {
+function Invoke-UserCreateWithRetry {
 	[CmdletBinding()]
 	param(
 		[Parameter(Mandatory = $true)]
 		[hashtable]$Headers,
 
 		[Parameter(Mandatory = $true)]
-		[object[]]$BatchUsers,
+		[string]$UserPrincipalName,
+
+		[Parameter(Mandatory = $true)]
+		[hashtable]$Body,
 
 		[Parameter(Mandatory = $true)]
 		[ValidateRange(1, 20)]
 		[int]$MaxRetries
 	)
 
-	$pendingUsers = @($BatchUsers)
-	$createdUsers = @()
-	$skippedUsers = @()
-	$failedUsers = @()
-	$attempt = 0
-
-	while ($pendingUsers.Count -gt 0) {
-		$attempt++
-		if ($attempt -gt $MaxRetries) {
-			foreach ($remainingUser in $pendingUsers) {
-				$failedUsers += [PSCustomObject]@{
-					userPrincipalName = $remainingUser.UserPrincipalName
-					reason = 'Max retry attempts exceeded.'
-				}
-			}
-			break
-		}
-
-		$requests = @()
-		$idToUserMap = @{}
-
-		for ($i = 0; $i -lt $pendingUsers.Count; $i++) {
-			$requestId = [string]$i
-			$user = $pendingUsers[$i]
-
-			$idToUserMap[$requestId] = $user
-			$requests += @{
-				id = $requestId
-				method = 'POST'
-				url = '/users'
-				headers = @{ 'Content-Type' = 'application/json' }
-				body = $user.Body
-			}
-		}
-
-		$batchBody = @{ requests = $requests }
-		$batchResponse = Invoke-GraphRequest -Method 'POST' -Uri 'https://graph.microsoft.com/v1.0/$batch' -Headers $Headers -Body $batchBody
-		$responses = @($batchResponse.responses)
-
-		$retryUsers = @()
-		$maxRetryAfterSeconds = 0
-
-		foreach ($response in $responses) {
-			$requestId = [string]$response.id
-			if (-not $idToUserMap.ContainsKey($requestId)) {
-				continue
-			}
-
-			$user = $idToUserMap[$requestId]
-			$status = [int]$response.status
-			$bodyErrorMessage = [string]$response.body.error.message
-
-			if ($status -eq 201 -or $status -eq 200) {
-				$createdUsers += [PSCustomObject]@{
-					userPrincipalName = [string]$response.body.userPrincipalName
-				}
-				continue
-			}
-
-			if ($status -eq 400 -and $bodyErrorMessage -match 'already exists') {
-				$skippedUsers += [PSCustomObject]@{
-					userPrincipalName = $user.UserPrincipalName
-					reason = 'User already exists.'
-				}
-				continue
-			}
-
-			if ($status -eq 409) {
-				$skippedUsers += [PSCustomObject]@{
-					userPrincipalName = $user.UserPrincipalName
-					reason = 'User already exists.'
-				}
-				continue
-			}
-
-			if ($status -eq 429 -or $status -eq 503 -or $status -eq 504 -or $status -ge 500) {
-				$retryUsers += $user
-				$retryAfterSeconds = Get-RetryAfterSeconds -ResponseHeaders $response.headers
-                Write-Warning "Retrying create for $($user.userPrincipalName) (HTTP $status, Retry-After: $retryAfterSeconds)"
-				if ($retryAfterSeconds -gt $maxRetryAfterSeconds) {
-					$maxRetryAfterSeconds = $retryAfterSeconds
-				}
-				continue
-			}
-
-			$failedUsers += [PSCustomObject]@{
-				userPrincipalName = $user.UserPrincipalName
-				reason = "HTTP ${status}: $bodyErrorMessage"
-			}
-		}
-
-		$pendingUsers = @($retryUsers)
-
-		if ($pendingUsers.Count -gt 0) {
-			$backoffSeconds = [Math]::Min(60, [int][Math]::Pow(2, $attempt))
-			$delaySeconds = [Math]::Max($maxRetryAfterSeconds, $backoffSeconds)
-			Write-Warning "Batch had $($pendingUsers.Count) retryable request(s). Waiting $delaySeconds second(s) before retry attempt $($attempt + 1)/$MaxRetries."
-			Start-Sleep -Seconds $delaySeconds
+	try {
+		$response = Invoke-GraphRequestWithRetry -Method 'POST' -Uri 'https://graph.microsoft.com/v1.0/users' -Headers $Headers -Body $Body -MaxRetries $MaxRetries
+		return [PSCustomObject]@{
+			Status = 'Created'
+			UserPrincipalName = [string]$response.userPrincipalName
+			Reason = $null
 		}
 	}
+	catch {
+		$statusCode = 0
+		if ($null -ne $_.Exception.Response) {
+			try {
+				$statusCode = [int]$_.Exception.Response.StatusCode
+			} catch {
+				$statusCode = 0
+			}
+		}
 
-	return [PSCustomObject]@{
-		Created = $createdUsers
-		Skipped = $skippedUsers
-		Failed = $failedUsers
+		$message = [string]$_.Exception.Message
+		if ($statusCode -eq 409 -or ($statusCode -eq 400 -and $message -match 'already exists')) {
+			return [PSCustomObject]@{
+				Status = 'Skipped'
+				UserPrincipalName = $UserPrincipalName
+				Reason = 'User already exists.'
+			}
+		}
+
+		return [PSCustomObject]@{
+			Status = 'Failed'
+			UserPrincipalName = $UserPrincipalName
+			Reason = "HTTP ${statusCode}: $message"
+		}
 	}
 }
 
@@ -213,8 +117,7 @@ function New-TestUsers {
 		[int]$StartNumber
 	)
 
-	$BatchSize = $script:BatchSize
-	$MaxBatchRetries = $script:MaxBatchRetries
+	$MaxRequestRetries = $script:MaxRequestRetries
 
 	$token = Get-GraphToken
 	$headers = @{
@@ -224,50 +127,43 @@ function New-TestUsers {
 
 	$tenantDomain = Get-DefaultTenantDomain -Headers $headers
 
-	Write-Host "Using tenant domain: $tenantDomain"
-	Write-Host "Creating $Count test user(s) in batches of $BatchSize"
+	Write-Verbose "Using tenant domain: $tenantDomain"
+	Write-Verbose "Creating $Count test user(s) using per-user Graph requests with retry"
 
 	$createdUsers = @()
 	$skippedUsers = @()
 	$failedUsers = @()
 
-	$processed = 0
-	for ($offset = 0; $offset -lt $Count; $offset += $BatchSize) {
-		$currentBatchCount = [Math]::Min($BatchSize, $Count - $offset)
-		$batchUsers = @()
+	for ($i = 0; $i -lt $Count; $i++) {
+		$n = $StartNumber + $i
+		$displayName = "Test User $n"
+		$mailNickname = "test.user$n"
+		$userPrincipalName = "$mailNickname@$tenantDomain"
 
-		for ($j = 0; $j -lt $currentBatchCount; $j++) {
-			$n = $StartNumber + $offset + $j
-			$displayName = "Test User $n"
-			$mailNickname = "test.user$n"
-			$userPrincipalName = "$mailNickname@$tenantDomain"
-
-			$body = @{
-				accountEnabled = $false
-				displayName = $displayName
-				givenName = 'Test'
-				surname = "User $n"
-				mailNickname = $mailNickname
-				userPrincipalName = $userPrincipalName
-				passwordProfile = @{
-					forceChangePasswordNextSignIn = $true
-					password = Get-RandomPassword -Length 40
-				}
-			}
-
-			$batchUsers += [PSCustomObject]@{
-				UserPrincipalName = $userPrincipalName
-				Body = $body
+		$body = @{
+			accountEnabled = $false
+			displayName = $displayName
+			givenName = 'Test'
+			surname = "User $n"
+			mailNickname = $mailNickname
+			userPrincipalName = $userPrincipalName
+			passwordProfile = @{
+				forceChangePasswordNextSignIn = $true
+				password = Get-RandomPassword -Length 40
 			}
 		}
 
-		$batchResult = Invoke-UserCreateBatchWithRetry -Headers $headers -BatchUsers $batchUsers -MaxRetries $MaxBatchRetries
-		$createdUsers += @($batchResult.Created)
-		$skippedUsers += @($batchResult.Skipped)
-		$failedUsers += @($batchResult.Failed)
+		$createResult = Invoke-UserCreateWithRetry -Headers $headers -UserPrincipalName $userPrincipalName -Body $body -MaxRetries $MaxRequestRetries
+		if ($createResult.Status -eq 'Created') {
+			$createdUsers += [PSCustomObject]@{ userPrincipalName = $createResult.UserPrincipalName }
+		} elseif ($createResult.Status -eq 'Skipped') {
+			$skippedUsers += [PSCustomObject]@{ userPrincipalName = $createResult.UserPrincipalName; reason = $createResult.Reason }
+		} else {
+			$failedUsers += [PSCustomObject]@{ userPrincipalName = $createResult.UserPrincipalName; reason = $createResult.Reason }
+		}
 
-		$processed += $currentBatchCount
-		Write-Host "Progress: $processed/$Count processed | Created: $($createdUsers.Count) | Skipped: $($skippedUsers.Count) | Failed: $($failedUsers.Count)"
+		$processed = $i + 1
+		Write-Verbose "Progress: $processed/$Count processed | Created: $($createdUsers.Count) | Skipped: $($skippedUsers.Count) | Failed: $($failedUsers.Count)"
 	}
 
 	return [PSCustomObject]@{
@@ -278,7 +174,7 @@ function New-TestUsers {
 }
 
 $result = New-TestUsers -Count $Count -StartNumber $StartNumber
-Write-Host "Done. Created $($result.Created.Count) user(s), skipped $($result.Skipped.Count), failed $($result.Failed.Count)."
+Write-Verbose "Done. Created $($result.Created.Count) user(s), skipped $($result.Skipped.Count), failed $($result.Failed.Count)."
 
 if ($result.Failed.Count -gt 0) {
 	Write-Warning 'Some users failed to create. First 20 failures:'

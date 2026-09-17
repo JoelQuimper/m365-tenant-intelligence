@@ -17,4 +17,4 @@ $projectRoot = "C:\path\to\your\project"
 $global:VerbosePreference = 'Continue'
 
 Import-Module -Name "$projectRoot/Common/GraphClient/GraphClient.psm1" -Force
-c
+Import-Module -Name "$projectRoot/Common/StorageClient/StorageClient.psm1" -Force

@@ -2,6 +2,14 @@
 param(
 )
 
+# Import required modules
+$projectRoot = "C:\src\public-github\m365-tenant-intelligence"
+Import-Module -Name "$projectRoot\Automations\Common\GraphClient\GraphClient.psm1" -Force
+Import-Module -Name "$projectRoot\Automations\Common\StorageClient\StorageClient.psm1" -Force
+
+# Source the Set-DeveloperContext to load environment variables
+. "$projectRoot\Automations\Set-DeveloperContext.ps1"
+
 function Get-AllUsers {
 	[CmdletBinding()]
 	param()
@@ -11,10 +19,9 @@ function Get-AllUsers {
 		Authorization = "Bearer $token"
 		'Content-Type' = 'application/json'
 	}
-	# $runFolderName = "users/$((Get-Date).ToString('yyyy-MM-dd_HH-mm-ss'))"
-	$runFolderName = "users"
+	$runFolderName = "users/$((Get-Date).ToString('yyyy-MM-dd_HH-mm-ss'))"
 	$storageFolder = New-StorageContainerFolder -FolderPath $runFolderName
-	Write-Host "Created storage folder '$($storageFolder.FolderPath)' (marker: $($storageFolder.MarkerBlob))."
+	Write-Verbose "Created storage folder '$($storageFolder.FolderPath)' (marker: $($storageFolder.MarkerBlob))."
 
 	# Include userType to ensure guest users are present in the dataset.
 	$selectProperties = @(
@@ -48,12 +55,12 @@ function Get-AllUsers {
 
 	$selectQuery = ($selectProperties -join ',')
 	$usersUri = "https://graph.microsoft.com/v1.0/users?`$select=$selectQuery&`$top=999"
-	Write-Host "Fetching all users from Microsoft Graph with this url: $usersUri"
+	Write-Verbose "Fetching all users from Microsoft Graph with this url: $usersUri"
 
 	try {
 		# Fetch all users using paged request
 		$allUsers = @(Invoke-GraphPagedRequest -Uri $usersUri -Headers $headers)
-		Write-Host "Retrieved $($allUsers.Count) user(s), including guests."
+		Write-Verbose "Retrieved $($allUsers.Count) user(s), including guests."
 
 		# Batch configuration
 		$batchSize = 2000
@@ -76,10 +83,10 @@ function Get-AllUsers {
 			Write-Verbose "Processing batch $batchNumber with $($batchUsers.Count) users..."
 			[int]$uploadedCount = Write-UsersToJsonlGz -Users $batchUsers.ToArray() -BatchNumber $batchNumber -StorageFolder $storageFolder.FolderPath
 			$totalUsersUploaded = $totalUsersUploaded + $uploadedCount
-			Write-Host "Uploaded batch $batchNumber with $uploadedCount users."
+			Write-Verbose "Uploaded batch $batchNumber with $uploadedCount users."
 		}
 
-		Write-Host "Completed: Uploaded $totalUsersUploaded total users in $batchNumber batch(es)."
+		Write-Verbose "Completed: Uploaded $totalUsersUploaded total users in $batchNumber batch(es)."
 		return @{
 			StorageFolder = $storageFolder
 			TotalUsersUploaded = $totalUsersUploaded
@@ -90,8 +97,8 @@ function Get-AllUsers {
 		$message = $_.Exception.Message
 		$stackTrace = $_.ScriptStackTrace
 		$line = $_.InvocationInfo.ScriptLineNumber
-		Write-Host "ERROR at line $line : $stackTrace"
-		Write-Host "Full Exception: $($_ | Format-List -Force | Out-String)"
+		Write-Verbose "ERROR at line $line : $stackTrace"
+		Write-Verbose "Full Exception: $($_ | Format-List -Force | Out-String)"
 		throw "Failed to retrieve and process users. Original error: $message"
 	}
 }
@@ -169,18 +176,18 @@ function Write-UsersToJsonlGz {
 		$message = $_.Exception.Message
 		$line = $_.InvocationInfo.ScriptLineNumber
 		$stackTrace = $_.ScriptStackTrace
-		Write-Host "ERROR in Write-UsersToJsonlGz at line $line"
-		Write-Host "Stack: $stackTrace"
-		Write-Host "Message: $message"
+		Write-Verbose "ERROR in Write-UsersToJsonlGz at line $line"
+		Write-Verbose "Stack: $stackTrace"
+		Write-Verbose "Message: $message"
 		throw "Failed to write users batch to compressed JSONL file. Original error: $message"
 	}
 }
 
 $result = Get-AllUsers
 
-Write-Host "Completed user data ingestion."
-Write-Host "Storage Folder: $($result.StorageFolder.FolderPath)"
-Write-Host "Total Users Uploaded: $($result.TotalUsersUploaded)"
-Write-Host "Batches Created: $($result.BatchesCreated)"
+Write-Verbose "Completed user data ingestion."
+Write-Verbose "Storage Folder: $($result.StorageFolder.FolderPath)"
+Write-Verbose "Total Users Uploaded: $($result.TotalUsersUploaded)"
+Write-Verbose "Batches Created: $($result.BatchesCreated)"
 
 

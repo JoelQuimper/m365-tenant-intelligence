@@ -11,11 +11,7 @@
 	FunctionsToExport = @(
 		'Get-GraphToken',
 		'Invoke-GraphRequestWithRetry',
-		'Invoke-GraphPagedRequest',
-		'Invoke-GraphBatchWithItemRetry',
-		'Write-StorageContainerFile',
-		'New-StorageContainerFolder',
-		'Remove-StorageContainerFolder'
+		'Invoke-GraphPagedRequest'
 	)
 
 	CmdletsToExport   = @()
